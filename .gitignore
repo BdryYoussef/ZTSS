@@ -1,0 +1,9 @@
+*.out
+__pycache__/
+*.tar.gz
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+raw/
