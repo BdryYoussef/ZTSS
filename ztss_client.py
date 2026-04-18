@@ -321,6 +321,72 @@ class ZTSSClient:
         )
         return result
 
+    # ── Download + decrypt ────────────────────────────────────────────────────
+
+    def download_and_decrypt(self, root_cid: str, kfile: bytes) -> bytes:
+        """
+        GET /download/{root_cid} with JWT + EdDSA PoP, then decrypt locally.
+
+        Flow:
+          1. Acquire a fresh per-request PoP challenge (same pattern as upload).
+          2. GET /download/{root_cid} with Authorization + X-ZTSS-PoP headers.
+          3. Sort returned chunks by index and reassemble the ciphertext blob.
+          4. Simulate local PRE decryption: strip the 12-byte nonce prefix and
+             the 16-byte AES-GCM authentication tag, then run AES-256-GCM
+             decryption with the original Kfile.
+          5. Print and return the recovered plaintext.
+
+        Args:
+            root_cid: Hex MerkleRoot returned by upload().
+            kfile:    The 32-byte per-file symmetric key used at upload time.
+
+        Returns:
+            Decrypted plaintext bytes.
+        """
+        token = self._ensure_token()
+
+        # Fresh per-request PoP challenge (mirrors upload PoP pattern).
+        challenge = random_bytes(32)
+        pop_sig   = self.identity.sign_pop(challenge)
+
+        headers = {
+            "Authorization":    f"Bearer {token}",
+            "X-ZTSS-Challenge": _b64url(challenge),
+            "X-ZTSS-PoP":       _b64url(pop_sig),
+        }
+
+        resp = self._session.get(
+            self.base_url + f"/download/{root_cid}",
+            headers=headers,
+            timeout=30,
+        )
+        _raise_for_status(resp)
+        chunks_data: list = resp.json()  # [{ index, cid, data }, …]
+
+        # Sort ascending by index so reassembly is deterministic.
+        chunks_data.sort(key=lambda c: c["index"])
+
+        # Reassemble the full ciphertext blob (nonce ‖ ct ‖ tag).
+        # Each chunk's data field is standard base64 as written by the server.
+        ciphertext_blob = b"".join(
+            base64.b64decode(c["data"]) for c in chunks_data
+        )
+
+        _print(
+            f"- Downloaded **{len(chunks_data)} chunk(s)**, "
+            f"ciphertext blob = {len(ciphertext_blob):,} bytes\n"
+            f"- Stripping 12-byte nonce prefix + 16-byte GCM tag (PRE simulation)…"
+        )
+
+        # Local PRE decryption: AES-256-GCM with Kfile.
+        # Wire format: [nonce:12B][ciphertext+tag:N+16B]  (see aes_gcm_encrypt).
+        plaintext = aes_gcm_decrypt(kfile, ciphertext_blob)
+
+        _print(
+            f"- ✅ Decrypted — recovered **{len(plaintext):,} bytes** plaintext\n"
+        )
+        return plaintext
+
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
     def _get(self, path: str) -> dict:
@@ -432,6 +498,18 @@ def run_demo(
         chunks=chunks,
     )
 
+    # 5d  Download + decrypt (full round-trip)
+    _print("\n### 5d — GET /download/{root_cid} + AES-256-GCM decrypt")
+    recovered = client.download_and_decrypt(root_cid=root_hex, kfile=kfile)
+
+    # Integrity check: recovered plaintext must match original.
+    if recovered != plaintext:
+        raise AssertionError(
+            f"Round-trip integrity FAILED — "
+            f"recovered {len(recovered):,} B ≠ original {len(plaintext):,} B"
+        )
+    _print("- ✅ **Round-trip integrity verified** — recovered plaintext matches original\n")
+
     # ── Step 6: Key wrapping (illustrative) ──────────────────────────────────
     _print("\n## Step 6 — Key encapsulation (ECIES/HKDF, illustrative)")
     # In production: Kenc = ECIES(PK_dest, Kfile)
@@ -500,30 +578,139 @@ def _raise_for_status(resp: requests.Response) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §5  CLI entry-point (optional — also importable from demo.ipynb)
+# §5  CLI entry-point
+#
+#   python3 ztss_client.py upload   <filepath>
+#   python3 ztss_client.py download <root_cid> <output_filepath> --key <hex>
+#
+# The upload command prints root_cid and key_hex.  Pass both to download.
+# In a real PRE deployment the key would be wrapped with ECIES and delivered
+# out-of-band; here we accept it as a hex string to keep the demo self-contained.
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
+    import pathlib
 
-    parser = argparse.ArgumentParser(description="ZTSS demo client")
-    parser.add_argument(
+    # host:8090 is Docker's published port for the Go API (container :8080)
+    _DEFAULT_URL = "http://localhost:8090"
+
+    root_parser = argparse.ArgumentParser(
+        prog="ztss_client",
+        description="ZTSS CLI — encrypt-upload / download-decrypt",
+    )
+    root_parser.add_argument(
         "--url",
-        default="http://localhost:8090",
-        help="ZTSS API base URL (default: http://localhost:8090)",
+        default=_DEFAULT_URL,
+        metavar="URL",
+        help=f"API base URL (default: {_DEFAULT_URL})",
     )
-    parser.add_argument(
-        "--file",
-        default=None,
-        help="Path to a file to encrypt+upload (default: 300 KB synthetic payload)",
+
+    sub = root_parser.add_subparsers(dest="command", required=True)
+
+    # ── upload subcommand ─────────────────────────────────────────────────────
+    up_p = sub.add_parser(
+        "upload",
+        help="Read a file, encrypt it client-side, and upload to ZTSS.",
     )
-    args = parser.parse_args()
+    up_p.add_argument("filepath", help="Path to the file to encrypt and upload.")
 
-    plaintext: bytes | None = None
-    if args.file:
-        with open(args.file, "rb") as fh:
-            plaintext = fh.read()
+    # ── download subcommand ───────────────────────────────────────────────────
+    dl_p = sub.add_parser(
+        "download",
+        help="Fetch encrypted chunks by root_cid, decrypt, and write to disk.",
+    )
+    dl_p.add_argument("cid",            help="root_cid (64-char hex) returned by upload.")
+    dl_p.add_argument("output_filepath", help="Destination path for the decrypted file.")
+    dl_p.add_argument(
+        "--key",
+        required=True,
+        metavar="HEX",
+        help="Hex-encoded 32-byte Kfile printed by the upload command.",
+    )
 
-    summary = run_demo(base_url=args.url, plaintext=plaintext)
-    print("\n=== Summary ===")
-    print(json.dumps(summary, indent=2))
+    args = root_parser.parse_args()
+    base_url: str = args.url
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # upload — Alice flow
+    # ─────────────────────────────────────────────────────────────────────────
+    if args.command == "upload":
+        src = pathlib.Path(args.filepath)
+        if not src.is_file():
+            sys.exit(f"[error] file not found: {src}")
+
+        plaintext = src.read_bytes()
+        print(f"[upload] read {len(plaintext):,} bytes from '{src}'")
+
+        # Step 1 — per-file symmetric key
+        kfile = random_bytes(AES_KEY_SIZE)
+
+        # Step 2 — AES-256-GCM encrypt (client-side, ES2)
+        ciphertext_blob, nonce = aes_gcm_encrypt(kfile, plaintext)
+
+        # Step 3 — chunk + SHA-256 CIDs
+        chunks     = chunk_data(ciphertext_blob)
+        chunk_cids = [sha256_cid(c) for c in chunks]
+        print(f"[upload] {len(chunks)} chunk(s), "
+              f"ciphertext = {len(ciphertext_blob):,} bytes")
+
+        # Step 4 — Merkle root (file descriptor)
+        root_hex = merkle_root(chunk_cids).hex()
+        print(f"[upload] root_cid = {root_hex}")
+
+        # Step 5 — Alice: register → token → upload
+        alice = ZTSSClient(base_url=base_url)
+        alice.register()
+        alice.get_token()
+        result = alice.upload(
+            ciphertext_blob=ciphertext_blob,
+            root_cid_hex=root_hex,
+            chunk_cids=chunk_cids,
+            chunks=chunks,
+        )
+
+        print("\n=== Upload complete ===")
+        print(json.dumps({
+            "root_cid":      result["root_cid"],
+            "chunks_count":  result["chunks_count"],
+            "key_hex":       kfile.hex(),   # KEEP SECRET — needed to decrypt
+            "nonce_hex":     nonce.hex(),
+        }, indent=2))
+        print("\n[!] Save key_hex — pass it to the download command via --key.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # download — Bob flow (simulated PRE: Kfile delivered via --key)
+    # ─────────────────────────────────────────────────────────────────────────
+    elif args.command == "download":
+        root_cid = args.cid
+        out_path = pathlib.Path(args.output_filepath)
+
+        # Decode and validate the key.
+        try:
+            kfile = bytes.fromhex(args.key)
+        except ValueError as exc:
+            sys.exit(f"[error] --key must be a valid hex string: {exc}")
+        if len(kfile) != AES_KEY_SIZE:
+            sys.exit(
+                f"[error] --key decodes to {len(kfile)} bytes; "
+                f"expected {AES_KEY_SIZE} (AES-256)."
+            )
+
+        print(f"[download] root_cid  = {root_cid}")
+        print(f"[download] output    = {out_path}")
+
+        # Bob registers his own identity and authenticates independently.
+        # In a real PRE scenario the server would re-encrypt with Bob's public
+        # key; here we simulate that the Kfile was delivered out-of-band.
+        bob = ZTSSClient(base_url=base_url)
+        bob.register()
+        bob.get_token()
+
+        plaintext = bob.download_and_decrypt(root_cid=root_cid, kfile=kfile)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(plaintext)
+
+        print(f"\n=== Download complete ===")
+        print(f"Wrote {len(plaintext):,} bytes → {out_path.resolve()}")
